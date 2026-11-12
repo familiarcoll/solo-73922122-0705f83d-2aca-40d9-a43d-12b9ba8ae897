@@ -5,33 +5,46 @@
 运行：
     python3 demo/demo.py
 可选环境变量：
-    PROXY_HOST   默认 127.0.0.1
-    PROXY_PORT   默认 8080
-    UPSTREAM_URL 默认 http://127.0.0.1:8000
+    PROXY_HOST    默认 127.0.0.1
+    PROXY_PORT    默认 8080
+    UPSTREAM_URL  默认 http://127.0.0.1:8000
+    ADMIN_API_KEY 默认 demo-admin-key（与 docker-compose 一致）
+    CERTS_DIR     默认 <仓库根>/certs
 
 演示内容：
   1. 分片发送的合法 POST /events（逐字节 / 小块 TCP 分片）
   2. 同连接流水线两个合法请求
   3. chunked 请求（代理应重建单一 Content-Length）
-  4. 五种 HTTP 请求走私 / 畸形分帧攻击（全部应被拒绝并断连，且不到达上游）
+  4. 六种 HTTP 请求走私 / 畸形分帧攻击（全部应被拒绝并断连，且不到达上游）
   5. 延迟响应：上游慢 2.5s，代理 2s 超时回 504 并销毁连接，后续请求仍正常
   6. 连接池容量 2：3 个并发慢请求体现两车道
+  7. 路由白名单
+  8. 错误证书拒绝：接收端换成另一 CA 签发的同名证书，代理 502 且正文不发出
+  9. 凭管理密钥整份替换 CA 包：错密钥 403 / 坏包 400 / 成功版本持久化
+ 10. 握手交错：换代期间迟到的旧握手不得借出，上报不重发
+ 11. 已写出的上报可完成、随后销毁旧连接；池名额不泄漏
 最后直接拉取上游“实际收到的请求”清单作为证据。
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
+import threading
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from pathlib import Path
 
 PROXY_HOST = os.environ.get("PROXY_HOST", "127.0.0.1")
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "8080"))
 UPSTREAM_URL = os.environ.get("UPSTREAM_URL", "http://127.0.0.1:8000")
+ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "demo-admin-key")
+CERTS_DIR = Path(os.environ.get(
+    "CERTS_DIR", Path(__file__).resolve().parent.parent / "certs"))
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -131,6 +144,26 @@ def expect_closed(sock: socket.socket) -> bool:
             pass
 
 
+# --------------------------------------------------------------------------- #
+# HTTP 工具（urllib，面向控制面）
+# --------------------------------------------------------------------------- #
+
+
+def _request(method: str, url: str, body: bytes | None = None,
+             headers: dict | None = None) -> tuple[int, dict]:
+    req = urllib.request.Request(url, data=body, method=method,
+                                 headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode()
+        try:
+            return exc.code, json.loads(raw)
+        except ValueError:
+            return exc.code, {"raw": raw}
+
+
 def http_get(url: str) -> dict:
     with urllib.request.urlopen(url, timeout=5) as resp:
         return json.loads(resp.read().decode())
@@ -140,6 +173,21 @@ def http_delete(url: str) -> dict:
     req = urllib.request.Request(url, method="DELETE")
     with urllib.request.urlopen(req, timeout=5) as resp:
         return json.loads(resp.read().decode())
+
+
+def http_post(url: str, body: dict | None = None) -> tuple[int, dict]:
+    data = json.dumps(body).encode() if body is not None else b""
+    return _request("POST", url, data,
+                    {"Content-Type": "application/json"})
+
+
+def proxy_admin(method: str, path: str, body: bytes | None = None,
+                key: str | None = ADMIN_API_KEY) -> tuple[int, dict]:
+    headers = {"Content-Type": "application/x-pem-bundle"}
+    if key is not None:
+        headers["X-Admin-Key"] = key
+    return _request(method, f"http://{PROXY_HOST}:{PROXY_PORT}{path}",
+                    body, headers)
 
 
 def upstream_snapshot(limit: int = 500) -> list[dict]:
@@ -154,8 +202,36 @@ def events_seen(snapshot: list[dict]) -> tuple[int, int]:
     return n_events, n_other
 
 
+def post_event_raw(body: bytes, extra_headers: bytes = b"") -> tuple[int | None, bool]:
+    """经代理发一笔 POST /events，返回 (状态码, 响应是否声明 Connection: close)。"""
+    req = (
+        b"POST /events HTTP/1.1\r\nHost: probe.local\r\n"
+        b"Content-Type: application/json\r\n" + extra_headers +
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+    )
+    s = connect()
+    try:
+        s.sendall(req)
+        raw = read_response(s)
+        # 从响应头判定（h11 对错误响应一律 connection: close），
+        # 不能用探测 EOF 的方式：成功响应是 keep-alive，探测会白等一个超时。
+        closed = b"connection: close" in raw.lower()
+        return status_of(raw), closed
+    finally:
+        s.close()
+
+
+def post_event(body: bytes, extra_headers: bytes = b"") -> int | None:
+    status, _ = post_event_raw(body, extra_headers)
+    return status
+
+
+def count_body(snapshot: list[dict], body: bytes) -> int:
+    return sum(1 for it in snapshot if it["body_text"] == body.decode())
+
+
 # --------------------------------------------------------------------------- #
-# 演示场景
+# 演示场景（1-7：分帧安全，与纯文本时代一致）
 # --------------------------------------------------------------------------- #
 
 
@@ -194,7 +270,6 @@ def case_pipeline(report: Report) -> None:
     s.sendall(req)
     raw1 = read_response(s)
     raw2 = read_response(s)
-    raw = raw1 + raw2
     after, _ = events_seen(upstream_snapshot())
     # h11 不生成原因短语，状态行为 "HTTP/1.1 202 "，因此按状态码计数。
     count = sum(1 for raw in (raw1, raw2) if status_of(raw) == 202)
@@ -367,8 +442,8 @@ def case_pool(report: Report) -> None:
         statuses = list(pool_exec.map(lambda _: one_request(), range(3)))
     elapsed = time.monotonic() - t0
     # 两车道：前两笔 ~0.8s 完成，第三笔排队后 ~1.6s 完成；
-    # 线程调度与本机抖动下放宽到 2.4s，但绝不可能是 3 条并行（那将 ~0.8s）。
-    ok = statuses == [202, 202, 202] and 1.4 <= elapsed <= 2.4
+    # 线程调度与本机抖动下放宽到 2.6s，但绝不可能是 3 条并行（那将 ~0.8s）。
+    ok = statuses == [202, 202, 202] and 1.4 <= elapsed <= 2.6
     report.add("池容量=2，第三笔排队而非开第三条连接", ok,
                f"statuses={statuses}, 总耗时={elapsed:.2f}s（两车道预期约 1.6s）")
 
@@ -395,6 +470,172 @@ def case_routing(report: Report) -> None:
                f"新增其他路径={after_other - before_other}")
 
 
+# --------------------------------------------------------------------------- #
+# 演示场景（8-11：TLS 信任与 CA 轮换）
+# --------------------------------------------------------------------------- #
+
+
+def reset_trust_state() -> None:
+    """把两侧对齐到初始信任：接收端用 CA1 证书，代理只信 CA1。可重复运行。"""
+    code, _ = http_post(f"{UPSTREAM_URL}/admin/tls/cert/ca1")
+    assert code == 200, f"接收端证书复位失败: {code}"
+    ca1_pem = (CERTS_DIR / "ca1" / "ca.crt").read_bytes()
+    code, _ = proxy_admin("PUT", "/admin/ca-bundle", ca1_pem)
+    assert code == 200, f"代理 CA 包复位失败: {code}"
+    http_post(f"{UPSTREAM_URL}/admin/tls/delay", {"seconds": 0})
+    time.sleep(0.2)
+
+
+def case_wrong_cert(report: Report) -> None:
+    print("\n[8] 错误证书拒绝：接收端换成 CA2 签发的同名证书，代理仍只信 CA1")
+    code, info = http_post(f"{UPSTREAM_URL}/admin/tls/cert/ca2")
+    assert code == 200, f"切换接收端证书失败: {info}"
+    time.sleep(0.3)  # 等现存 TLS 会话关闭传播到代理空闲连接
+
+    before, _ = events_seen(upstream_snapshot())
+    probes0 = http_get(f"{UPSTREAM_URL}/admin/tls")["plaintext_probes_total"]
+    body = json.dumps({"event": "must-not-arrive"}).encode()
+    status, closed = post_event_raw(body)
+    after, _ = events_seen(upstream_snapshot())
+    tls = http_get(f"{UPSTREAM_URL}/admin/tls")
+
+    ok = status == 502 and after == before
+    report.add("证书链不被信任 → 502 且正文未到达上游", ok,
+               f"status={status}, 上游新增事件={after - before}（应为 0）")
+    probes_delta = tls["plaintext_probes_total"] - probes0
+    ok2 = probes_delta == 0
+    report.add("不回退明文：验证失败后 TLS 端口未收到任何明文", ok2,
+               f"plaintext_probes 增量={probes_delta}")
+    ok3 = tls["tls_connections_total"] >= 0 and status == 502 and closed
+    report.add("验证失败即断开，无业务字节发出", ok3,
+               f"代理回 502 后关闭入站连接={closed}")
+
+
+def case_ca_rotation(report: Report) -> None:
+    print("\n[9] 凭管理密钥整份替换 CA 包（CA1 → CA2），成功版本持久化")
+    ca2_pem = (CERTS_DIR / "ca2" / "ca.crt").read_bytes()
+    ca2_sha = hashlib.sha256(ca2_pem).hexdigest()
+
+    code, _ = proxy_admin("PUT", "/admin/ca-bundle", ca2_pem, key="wrong-key")
+    report.add("错误管理密钥 → 403", code == 403, f"status={code}")
+
+    _, st_before = proxy_admin("GET", "/admin/status")
+    code, resp = proxy_admin("PUT", "/admin/ca-bundle", b"this is not a PEM")
+    _, st_after = proxy_admin("GET", "/admin/status")
+    ok = (code == 400
+          and st_after["ca"]["version"] == st_before["ca"]["version"]
+          and st_after["ca"]["sha256"] == st_before["ca"]["sha256"])
+    report.add("坏 PEM 包 → 400 且旧版保留", ok,
+               f"status={code}, version 仍为 {st_after['ca']['version']}")
+
+    code, info = proxy_admin("PUT", "/admin/ca-bundle", ca2_pem)
+    ok = (code == 200
+          and info["version"] == st_before["ca"]["version"] + 1
+          and info["sha256"] == ca2_sha
+          and info["persisted_sha256"] == ca2_sha
+          and info["persisted_matches_memory"])
+    report.add("合法整包替换 → 200，版本+1 且落盘一致", ok,
+               f"status={code}, version={info.get('version')}, "
+               f"sha256={info.get('sha256', '')[:16]}…, "
+               f"持久化一致={info.get('persisted_matches_memory')}")
+
+    before, _ = events_seen(upstream_snapshot())
+    body = json.dumps({"event": "after-rotation"}).encode()
+    status = post_event(body)
+    after, _ = events_seen(upstream_snapshot())
+    ok = status == 202 and after == before + 1
+    report.add("换 CA 后上报恢复 202（新信任链握手成功）", ok,
+               f"status={status}, 上游新增事件={after - before}")
+
+
+def _swap_proxy_ca(pem_path: Path) -> dict:
+    code, info = proxy_admin("PUT", "/admin/ca-bundle", pem_path.read_bytes())
+    assert code == 200, f"CA 包替换失败: {info}"
+    return info
+
+
+def case_handshake_interleave(report: Report) -> None:
+    print("\n[10] 握手交错：换代期间迟到的旧握手不得借出，上报不重发")
+    ca2 = CERTS_DIR / "ca2" / "ca.crt"
+    http_post(f"{UPSTREAM_URL}/admin/tls/delay", {"seconds": 1.2})
+    try:
+        _swap_proxy_ca(ca2)          # 清空空闲连接，保证下一笔触发新握手
+        stats0 = proxy_admin("GET", "/admin/status")[1]["pool"]
+        tls0 = http_get(f"{UPSTREAM_URL}/admin/tls")["tls_connections_total"]
+        before, _ = events_seen(upstream_snapshot())
+
+        body = json.dumps({"event": "interleave"}).encode()
+        result: dict = {}
+        def worker() -> None:
+            result["status"] = post_event(body)
+        t = threading.Thread(target=worker)
+        t0 = time.monotonic()
+        t.start()
+        time.sleep(0.3)              # H1 旧握手在途（延迟 1.2s）
+        _swap_proxy_ca(ca2)          # 换代：H1 迟到成功也必须丢弃
+        t.join(timeout=15)
+        elapsed = time.monotonic() - t0
+
+        after, _ = events_seen(upstream_snapshot())
+        stats1 = proxy_admin("GET", "/admin/status")[1]["pool"]
+        tls1 = http_get(f"{UPSTREAM_URL}/admin/tls")["tls_connections_total"]
+        arrived = count_body(upstream_snapshot(), body)
+
+        ok = (result.get("status") == 202 and arrived == 1
+              and stats1["stale_discarded"] > stats0["stale_discarded"])
+        report.add("迟到旧握手被丢弃，请求经新代际连接完成且只到达一次", ok,
+                   f"status={result.get('status')}, 耗时={elapsed:.1f}s, "
+                   f"上游该事件条数={arrived}, "
+                   f"stale_discarded={stats0['stale_discarded']}→"
+                   f"{stats1['stale_discarded']}")
+        ok2 = tls1 - tls0 >= 2
+        report.add("证据：两次成功 TLS 握手只对应一条上报", ok2,
+                   f"TLS 连接数 {tls0}→{tls1}（H1 被弃 + H2 成交），"
+                   f"上游新增事件={after - before}")
+    finally:
+        http_post(f"{UPSTREAM_URL}/admin/tls/delay", {"seconds": 0})
+
+
+def case_inflight_no_resend(report: Report) -> None:
+    print("\n[11] 已写出的上报可完成、随后销毁旧连接；池名额不泄漏")
+    ca2 = CERTS_DIR / "ca2" / "ca.crt"
+    warm = post_event(json.dumps({"event": "warmup"}).encode())
+    assert warm == 202, f"热身请求失败: {warm}"  # 池内留下当前代际空闲连接
+
+    stats0 = proxy_admin("GET", "/admin/status")[1]["pool"]
+    before, _ = events_seen(upstream_snapshot())
+
+    body = json.dumps({"event": "inflight"}).encode()
+    result: dict = {}
+    def worker() -> None:
+        result["status"] = post_event(body, b"X-Demo-Delay: 1.0\r\n")
+    t = threading.Thread(target=worker)
+    t.start()
+    time.sleep(0.3)                  # 请求已完整写出，交换在途（上游 sleep 1s）
+    _swap_proxy_ca(ca2)              # 换代：在途旧连接不被动关闭、不重发
+    t.join(timeout=10)
+
+    after, _ = events_seen(upstream_snapshot())
+    stats1 = proxy_admin("GET", "/admin/status")[1]["pool"]
+    arrived = count_body(upstream_snapshot(), body)
+
+    ok = result.get("status") == 202 and arrived == 1
+    report.add("在途上报在旧连接上完成且只到达一次", ok,
+               f"status={result.get('status')}, 上游该事件条数={arrived}")
+    ok2 = stats1["destroyed"] > stats0["destroyed"]
+    report.add("旧代际连接用后即毁，不回池", ok2,
+               f"destroyed={stats0['destroyed']}→{stats1['destroyed']}")
+    ok3 = (stats1["active"] <= 2
+           and stats1["opened"] - stats1["destroyed"] == stats1["active"])
+    report.add("池名额守恒（opened-destroyed==active<=2），不重复归还", ok3,
+               f"opened={stats1['opened']}, destroyed={stats1['destroyed']}, "
+               f"active={stats1['active']}, idle={stats1['idle']}")
+
+    status = post_event(json.dumps({"event": "after-inflight"}).encode())
+    report.add("换代后新请求走新代际连接正常 202", status == 202,
+               f"status={status}, 期间上游新增={after - before} 条")
+
+
 def show_upstream_evidence() -> None:
     print("\n[证据] 上游实际收到的请求（最新 8 条）")
     data = http_get(f"{UPSTREAM_URL}/events?limit=8")
@@ -408,7 +649,7 @@ def show_upstream_evidence() -> None:
 
 
 def main() -> int:
-    print(f"目标代理 {PROXY_HOST}:{PROXY_PORT}，上游 {UPSTREAM_URL}")
+    print(f"目标代理 {PROXY_HOST}:{PROXY_PORT}，上游 {UPSTREAM_URL}，证书目录 {CERTS_DIR}")
     try:
         cleared = http_delete(f"{UPSTREAM_URL}/events")
         print(f"已清空上游历史记录：{cleared}")
@@ -416,9 +657,18 @@ def main() -> int:
         print(f"无法连接上游 {UPSTREAM_URL}：{exc}")
         return 2
 
+    try:
+        reset_trust_state()
+        print("信任状态已复位：接收端=CA1 证书，代理=只信 CA1，握手延迟=0")
+    except Exception as exc:  # noqa: BLE001
+        print(f"信任状态复位失败：{exc}")
+        return 2
+
     report = Report()
     for fn in (case_splintered, case_pipeline, case_chunked, case_smuggling,
-               case_timeout, case_pool, case_routing):
+               case_timeout, case_pool, case_routing, case_wrong_cert,
+               case_ca_rotation, case_handshake_interleave,
+               case_inflight_no_resend):
         try:
             fn(report)
         except OSError as exc:

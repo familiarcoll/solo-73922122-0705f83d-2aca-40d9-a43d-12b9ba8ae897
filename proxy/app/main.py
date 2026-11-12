@@ -2,9 +2,15 @@
 HTTP/1.1 反向代理（asyncio + h11，单进程）
 
 职责：
-  * 仅放行 POST /events，其余请求拒绝并关闭入站连接；
+  * 仅放行 POST /events，其余业务请求拒绝并关闭入站连接；
   * 完整校验入站帧格式（重复 Content-Length、TE/CL 并存、非法分块、正文超限等），
     校验通过后丢弃原始分帧，重建单一 Content-Length 再转发；
+  * 上游为真实 TLS：地址与校验 DNS 名由启动配置固定，仅信任指定 CA 包，
+    核验证书链、有效期与主机名；验证失败不发正文，且绝不回退明文；
+  * 凭配置管理密钥提供 CA 包整份替换 API：先验证、再持久化、最后切换内存状态；
+    坏包或保存失败保留旧版；成功版本落盘，重启后仍生效；
+  * CA 切换后：尚未写出的上报只使用新 CA 验证的连接；旧空闲连接立即关闭；
+    迟到完成的旧握手不得借出；已写出的上报可完成，随后销毁旧连接，不因切换重发；
   * 固定上游，连接池容量 2，每条连接同一时刻只处理一笔；
   * 从发送起总限 2 秒；超时 / 客户端断连即销毁上游连接，迟到响应不会交给下一调用者；
   * 只有完整收齐带 Content-Length 的响应才把连接归还连接池。
@@ -16,8 +22,14 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
+import hmac
+import json
 import logging
 import os
+import re
+import ssl
+import tempfile
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -29,6 +41,7 @@ import h11
 # --------------------------------------------------------------------------- #
 
 MAX_BODY = 64 * 1024                      # 单请求正文硬上限 64 KiB
+ADMIN_MAX_BODY = 256 * 1024               # CA 包管理接口正文上限 256 KiB
 POOL_CAPACITY = 2                         # 上游连接池容量
 UPSTREAM_TIMEOUT = 2.0                    # 从发送起总限时 2 秒
 IDLE_TIMEOUT = 30.0                       # 入站连接空闲超时（防僵死占用）
@@ -37,7 +50,20 @@ READ_QUEUE_LWM = 2
 READ_BLOCK = 65536
 
 UPSTREAM_HOST = os.environ.get("UPSTREAM_HOST", "upstream")
-UPSTREAM_PORT = int(os.environ.get("UPSTREAM_PORT", "8000"))
+UPSTREAM_PORT = int(os.environ.get("UPSTREAM_PORT", "8443"))
+# 证书主机名（SNI/校验用 DNS 名）与 TCP 地址分离，二者都由启动配置固定。
+UPSTREAM_TLS_SERVER_NAME = os.environ.get(
+    "UPSTREAM_TLS_SERVER_NAME", "logs-receiver.local")
+# 连接 + TLS 握手限时（独立于 2 秒发送预算；握手延迟演示时不得超过该值）。
+CONNECT_TIMEOUT = float(os.environ.get("UPSTREAM_CONNECT_TIMEOUT", "3.0"))
+
+# CA 包持久化路径（成功版本落盘，重启后优先于种子）；种子由启动配置固定。
+CA_BUNDLE_PATH = os.environ.get("CA_BUNDLE_PATH", "/run/platform/ca-bundle.crt")
+CA_BUNDLE_SEED = os.environ.get("CA_BUNDLE_SEED", "/certs-seed/ca-bundle.crt")
+
+# 管理密钥：空值 = 关闭管理 API。生产部署必须配置为高强度随机值。
+ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
+
 LISTEN_HOST = os.environ.get("LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8080"))
 
@@ -71,7 +97,7 @@ class ClientGone(Exception):
 
 
 class UpstreamError(Exception):
-    """上游通信失败（连接、协议、对端关闭等）。"""
+    """上游通信失败（连接、TLS 验证、协议、对端关闭等）。"""
 
 
 class CloseAfterReply(Exception):
@@ -79,7 +105,195 @@ class CloseAfterReply(Exception):
 
 
 # --------------------------------------------------------------------------- #
-# 上游连接与连接池
+# 信任存储：CA 包整份替换，先验证、再持久化、最后切换内存指针
+# --------------------------------------------------------------------------- #
+
+_CERT_BLOCK_RE = re.compile(
+    rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.S)
+
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _read_file(path: str) -> bytes:
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+def _persist_atomic(path: str, data: bytes) -> None:
+    """原子写入：临时文件 + fsync + rename + 目录 fsync。
+
+    任何一步失败都抛 OSError，且不会破坏旧文件（rename 之前旧版本始终完整）。
+    """
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".ca-bundle-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def build_client_context(pem: bytes) -> tuple[ssl.SSLContext, int]:
+    """把 PEM CA 包解析为客户端 SSLContext。坏包抛 ValueError，不产生任何副作用。
+
+    PROTOCOL_TLS_CLIENT 默认即 CERT_REQUIRED + check_hostname；
+    链、有效期、主机名的核验在握手时由 OpenSSL 完成。
+    """
+    blocks = _CERT_BLOCK_RE.findall(pem)
+    if not blocks:
+        raise ValueError("no PEM certificate block found")
+    for block in blocks:
+        try:
+            ssl.PEM_cert_to_DER_cert(block.decode("ascii"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ValueError(f"malformed certificate block: {exc}") from exc
+    try:
+        text = pem.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("bundle is not UTF-8 PEM text") from exc
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.check_hostname = True
+    try:
+        ctx.load_verify_locations(cadata=text)
+    except ssl.SSLError as exc:
+        raise ValueError(f"no usable CA certificate: {exc}") from exc
+    return ctx, len(blocks)
+
+
+class TrustStore:
+    """当前 CA 信任状态：SSLContext + 代际号 + 版本号。
+
+    代际号在每次成功替换后单调递增；连接对象记录建立时的代际，
+    池据此识别“旧信任下的连接”。整份替换是原子的：调用方要么拿到
+    完整的新状态，要么保留完整旧状态。
+    """
+
+    def __init__(self, bundle_path: str, seed_path: str, server_name: str):
+        self._bundle_path = bundle_path
+        self._seed_path = seed_path
+        self.server_name = server_name
+        self._ctx: Optional[ssl.SSLContext] = None
+        self._generation = 0
+        self._version = 0
+        self._sha256 = ""
+        self._certs = 0
+        self._lock = asyncio.Lock()
+
+    # ---- 启动：持久化版本优先，缺失则用启动配置固定的种子 ------------------ #
+
+    def load_initial(self) -> None:
+        if os.path.exists(self._bundle_path):
+            pem = _read_file(self._bundle_path)
+            version = self._read_meta_version() or 1
+            source = "persisted"
+        else:
+            pem = _read_file(self._seed_path)  # 文件缺失/不可读 → 启动失败
+            _persist_atomic(self._bundle_path, pem)  # 无法持久化 → 启动失败
+            version = 1
+            source = "seed"
+        ctx, certs = build_client_context(pem)  # 持久化内容损坏 → 启动失败
+        self._ctx = ctx
+        self._certs = certs
+        self._sha256 = _sha256_hex(pem)
+        self._version = version
+        self._generation = 1
+        self._write_meta(source)
+        log.info(
+            "trust store ready: source=%s version=%d sha256=%s certs=%d server_name=%s",
+            source, self._version, self._sha256[:16], certs, self.server_name)
+
+    # ---- 查询 -------------------------------------------------------------- #
+
+    def snapshot(self) -> tuple[ssl.SSLContext, int]:
+        assert self._ctx is not None, "trust store not initialized"
+        return self._ctx, self._generation
+
+    @property
+    def generation(self) -> int:
+        return self._generation
+
+    def info(self) -> dict:
+        persisted_sha256: Optional[str] = None
+        try:
+            persisted_sha256 = _sha256_hex(_read_file(self._bundle_path))
+        except OSError:
+            pass
+        return {
+            "version": self._version,
+            "generation": self._generation,
+            "sha256": self._sha256,
+            "certificates": self._certs,
+            "bundle_path": self._bundle_path,
+            "persisted_sha256": persisted_sha256,
+            "persisted_matches_memory": persisted_sha256 == self._sha256,
+            "verify_server_name": self.server_name,
+        }
+
+    # ---- 整份替换 ------------------------------------------------------------ #
+
+    async def replace(self, pem: bytes) -> dict:
+        """验证 → 持久化 → 切换。坏包或保存失败都抛异常，旧版完整保留。"""
+        async with self._lock:
+            ctx, certs = build_client_context(pem)      # 坏包：ValueError
+            digest = _sha256_hex(pem)
+            _persist_atomic(self._bundle_path, pem)     # 保存失败：OSError
+            # 只有前两步都成功才切换内存状态。
+            self._version += 1
+            self._ctx = ctx
+            self._certs = certs
+            self._sha256 = digest
+            self._generation += 1
+            self._write_meta("api")
+            log.info(
+                "CA bundle replaced: version=%d generation=%d sha256=%s certs=%d",
+                self._version, self._generation, digest[:16], certs)
+            return self.info()
+
+    # ---- 版本元数据（旁车文件，尽力而为；bundle 文件本身才是真相） ---------- #
+
+    def _meta_path(self) -> str:
+        return self._bundle_path + ".meta.json"
+
+    def _read_meta_version(self) -> Optional[int]:
+        try:
+            with open(self._meta_path(), "r", encoding="utf-8") as fh:
+                return int(json.load(fh)["version"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    def _write_meta(self, source: str) -> None:
+        meta = {
+            "version": self._version,
+            "sha256": self._sha256,
+            "source": source,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        try:
+            _persist_atomic(self._meta_path(),
+                            json.dumps(meta, indent=2).encode("utf-8"))
+        except OSError as exc:
+            # 元数据失败不影响主版本：bundle 文件已安全落盘。
+            log.warning("meta persist failed (bundle itself is safe): %s", exc)
+
+
+# --------------------------------------------------------------------------- #
+# 上游连接与连接池（按 CA 代际管理）
 # --------------------------------------------------------------------------- #
 
 
@@ -88,8 +302,10 @@ class UpstreamConn:
     reader: asyncio.StreamReader
     writer: asyncio.StreamWriter
     conn: h11.Connection
+    generation: int                 # 建立连接（TLS 握手）时的 CA 代际
     busy: bool = False
     closed: bool = False
+    slot_returned: bool = False     # 幂等销毁：池名额只归还一次
     requests_served: int = 0
 
     def close(self) -> None:
@@ -109,39 +325,88 @@ class UpstreamConn:
 
 
 class UpstreamPool:
-    """容量固定为 2 的上游连接池；每条连接由 busy 保证同一时刻仅处理一笔。"""
+    """容量固定为 2 的上游连接池；每条连接由 busy 保证同一时刻仅处理一笔。
 
-    def __init__(self, host: str, port: int, capacity: int = POOL_CAPACITY):
+    代际规则：
+      * 借出前检查：空闲连接代际 != 当前代际 → 销毁，绝不借出；
+      * 新建连接握手完成时再检查：握手期间发生换代 → 迟到旧握手立即销毁；
+      * 归还时检查：旧代际连接用后销毁，不回池；
+      * close_stale_idle() 只清理旧代际空闲连接，绝不触碰新代际连接；
+      * destroy() 幂等：清理旧连接不会重复归还名额。
+    """
+
+    def __init__(self, host: str, port: int, trust: TrustStore,
+                 capacity: int = POOL_CAPACITY):
         self._host = host
         self._port = port
+        self._trust = trust
         self._capacity = capacity
         self._idle: list[UpstreamConn] = []
         self._active = 0
         self._cond = asyncio.Condition()
+        # 观测计数器（/admin/status 展示，演示脚本据此断言）
+        self.opened = 0
+        self.destroyed = 0
+        self.reused = 0
+        self.stale_discarded = 0
+
+    def trust_generation(self) -> int:
+        return self._trust.generation
 
     async def acquire(self) -> UpstreamConn:
-        # 最多按容量次数尝试，避免空闲连接被对端静默关闭时反复拿到死连接。
-        for _ in range(self._capacity + 1):
+        # 上限尝试次数：每次迭代要么借出、要么销毁一条坏连接并补回名额。
+        for _ in range(4 * self._capacity):
             uc = await self._take_slot()
             if uc is not None:
-                # 活性预检：对端若已半关闭，reader 会立刻 EOF。
-                if not uc.closed and not uc.reader.at_eof():
+                # 活性 + 代际预检：对端半关闭或旧代际的空闲连接直接销毁。
+                if (not uc.closed and not uc.reader.at_eof()
+                        and uc.generation == self._trust.generation):
                     uc.busy = True
+                    self.reused += 1
                     return uc
-                await self.destroy(uc)  # 死连接销毁并补名额，继续尝试
+                await self.destroy(uc)  # 死/旧连接销毁并补名额，继续尝试
                 continue
-            # 无空闲连接且池未满：在锁外新建，避免慢连接阻塞条件变量。
-            try:
+            uc = await self._connect_new()
+            if uc is not None:
+                return uc
+            # None = 握手期间换代，迟到旧握手已销毁，重试新代际
+        raise UpstreamError("pool exhausted while recovering connections")
+
+    async def _connect_new(self) -> Optional[UpstreamConn]:
+        ctx, gen = self._trust.snapshot()
+        try:
+            async with asyncio.timeout(CONNECT_TIMEOUT):
                 reader, writer = await asyncio.open_connection(
-                    self._host, self._port)
-            except OSError as exc:
-                async with self._cond:
-                    self._active -= 1
-                    self._cond.notify()
-                raise UpstreamError(f"connect upstream failed: {exc}") from exc
-            return UpstreamConn(reader, writer, h11.Connection(h11.CLIENT),
-                                busy=True)
-        raise UpstreamError("pool exhausted while recovering dead connections")
+                    self._host, self._port,
+                    ssl=ctx,
+                    server_hostname=self._trust.server_name,
+                    ssl_handshake_timeout=CONNECT_TIMEOUT)
+        except ssl.SSLCertVerificationError as exc:
+            await self._free_slot()
+            # 证书链 / 有效期 / 主机名任一不符：握手失败，正文尚未写出。
+            log.warning("TLS certificate verification failed: %s", exc.verify_message)
+            raise UpstreamError(
+                f"upstream certificate rejected: {exc.verify_message}") from exc
+        except (OSError, asyncio.TimeoutError) as exc:
+            await self._free_slot()
+            raise UpstreamError(f"connect/handshake upstream failed: {exc}") from exc
+        self.opened += 1
+        uc = UpstreamConn(reader, writer, h11.Connection(h11.CLIENT),
+                          generation=gen, busy=True)
+        if gen != self._trust.generation:
+            # 握手期间 CA 已换代：迟到的旧握手即使成功也不得借出。
+            self.stale_discarded += 1
+            log.warning(
+                "discarding late handshake of stale generation %d (current %d)",
+                gen, self._trust.generation)
+            await self.destroy(uc)
+            return None
+        return uc
+
+    async def _free_slot(self) -> None:
+        async with self._cond:
+            self._active -= 1
+            self._cond.notify()
 
     async def _take_slot(self) -> Optional[UpstreamConn]:
         async with self._cond:
@@ -154,23 +419,51 @@ class UpstreamPool:
                 await self._cond.wait()
 
     async def release(self, uc: UpstreamConn) -> None:
-        """完整成功交换后归还；损坏 / 已关闭的连接直接销毁。"""
+        """完整成功交换后归还；损坏 / 已关闭 / 旧代际的连接直接销毁。"""
         uc.busy = False
-        if uc.closed:
-            async with self._cond:
-                self._active -= 1
-                self._cond.notify()
+        if uc.closed or uc.generation != self._trust.generation:
+            await self.destroy(uc)
             return
         async with self._cond:
             self._idle.append(uc)
             self._cond.notify()
 
     async def destroy(self, uc: UpstreamConn) -> None:
-        """失败路径：销毁连接并腾出池名额。"""
+        """失败路径：销毁连接并腾出池名额。幂等：名额绝不重复归还。"""
+        if uc.slot_returned:
+            return
+        uc.slot_returned = True
+        uc.busy = False
         uc.close()
         async with self._cond:
             self._active -= 1
+            self.destroyed += 1
             self._cond.notify()
+
+    async def close_stale_idle(self, generation: int) -> int:
+        """关闭所有旧代际空闲连接；新代际连接（含换代后新建）绝不被触碰。"""
+        async with self._cond:
+            stale = [uc for uc in self._idle if uc.generation != generation]
+            if stale:
+                self._idle = [uc for uc in self._idle
+                              if uc.generation == generation]
+        for uc in stale:
+            await self.destroy(uc)
+        if stale:
+            log.info("closed %d stale idle connection(s) after CA switch",
+                     len(stale))
+        return len(stale)
+
+    def stats(self) -> dict:
+        return {
+            "capacity": self._capacity,
+            "active": self._active,
+            "idle": len(self._idle),
+            "opened": self.opened,
+            "destroyed": self.destroyed,
+            "reused": self.reused,
+            "stale_discarded": self.stale_discarded,
+        }
 
     async def aclose(self) -> None:
         async with self._cond:
@@ -356,8 +649,9 @@ async def _silent_await_cancel(task: asyncio.Task) -> None:
 
 
 class InboundProtocol(asyncio.Protocol):
-    def __init__(self, pool: UpstreamPool):
+    def __init__(self, pool: UpstreamPool, trust: TrustStore):
         self._pool = pool
+        self._trust = trust
         self._h11 = h11.Connection(
             h11.SERVER, max_incomplete_event_size=MAX_BODY)
         self._queue: asyncio.Queue = asyncio.Queue(READ_QUEUE_HWM)
@@ -455,9 +749,10 @@ class InboundProtocol(asyncio.Protocol):
 
     # ---- 回包 / 拒绝 ------------------------------------------------------ #
 
-    def send_simple(self, status: int, message: bytes, keep_alive: bool) -> None:
+    def send_simple(self, status: int, message: bytes, keep_alive: bool,
+                    content_type: bytes = b"text/plain; charset=utf-8") -> None:
         headers = [
-            (b"content-type", b"text/plain; charset=utf-8"),
+            (b"content-type", content_type),
             (b"content-length", str(len(message)).encode("ascii")),
             (b"connection", b"keep-alive" if keep_alive else b"close"),
         ]
@@ -465,6 +760,20 @@ class InboundProtocol(asyncio.Protocol):
         if message:
             self._send(self._h11.send(h11.Data(data=message)))
         self._send(self._h11.send(h11.EndOfMessage()))
+
+    async def _finish_gracefully(self) -> None:
+        """让出事件循环刷新缓冲后半关闭，保证客户端能读到刚写出的响应。"""
+        # 不能 pause_reading：那会触发 connection_lost，使 run() 的 finally
+        # 抢先硬关闭并 RST 掉刚写的响应。
+        await asyncio.sleep(0)
+        # 1 秒后兜底硬关闭，防止对端不配合导致连接悬挂。
+        loop = asyncio.get_running_loop()
+        loop.call_later(1.0, self._hard_close)
+        if self._transport is not None and self._transport.can_write_eof():
+            self._graceful_eof = True
+            self._transport.write_eof()
+        else:
+            self._hard_close()
 
     async def reject(self, status: int, reason: str) -> None:
         """拒绝并关闭：尽力回一个错误响应，刷新后半关闭，保证客户端能读到。"""
@@ -481,18 +790,7 @@ class InboundProtocol(asyncio.Protocol):
                 ],
             )))
             self._send(self._h11.send(h11.EndOfMessage()))
-            # 让出事件循环，确保 transport 把缓冲字节交付内核后再半关闭（FIN）。
-            # 不能 pause_reading：那会触发 connection_lost，使 run() 的 finally
-            # 抢先硬关闭并 RST 掉刚写的错误响应。
-            await asyncio.sleep(0)
-            # 1 秒后兜底硬关闭，防止对端不配合导致连接悬挂。
-            loop = asyncio.get_running_loop()
-            loop.call_later(1.0, self._hard_close)
-            if self._transport.can_write_eof():
-                self._graceful_eof = True
-                self._transport.write_eof()
-            else:
-                self._hard_close()
+            await self._finish_gracefully()
         except (h11.LocalProtocolError, ClientGone, OSError, RuntimeError):
             self._hard_close()
 
@@ -535,13 +833,20 @@ class InboundProtocol(asyncio.Protocol):
             target = request.target
             headers = list(request.headers)
 
+            # 所有路径（含管理 API）都先过分帧校验，防护不留旁路。
+            chunked, declared_cl = validate_framing(headers)
+
+            # 管理 API：凭配置管理密钥访问，处理完一律关闭连接。
+            if target.startswith(b"/admin/"):
+                await self._handle_admin(method, target, headers,
+                                         chunked, declared_cl)
+                return
+
             # 路由白名单：仅 POST /events，其余一律拒绝并关闭。
             if target != b"/events":
                 raise RejectRequest(404, f"path not allowed: {target.decode('ascii', 'replace')}")
             if method != b"POST":
                 raise RejectRequest(405, f"method not allowed: {method.decode('ascii', 'replace')}")
-
-            chunked, declared_cl = validate_framing(headers)
 
             # Expect: 100-continue —— 仅在分帧校验通过后才放行继续发送正文。
             if any(k.lower() == b"expect" and b"100-continue" in v.lower()
@@ -553,7 +858,7 @@ class InboundProtocol(asyncio.Protocol):
             if not chunked and declared_cl is not None and declared_cl > MAX_BODY:
                 raise RejectRequest(413, f"body exceeds {MAX_BODY} bytes")
 
-            body = await self._read_body(chunked, declared_cl)
+            body = await self._read_body(chunked, declared_cl, MAX_BODY)
             log.info(
                 "validated request %s target=/events bytes=%d chunked=%s",
                 self._peer, len(body), chunked,
@@ -566,7 +871,85 @@ class InboundProtocol(asyncio.Protocol):
                 return
             self._h11.start_next_cycle()
 
-    async def _read_body(self, chunked: bool, declared_cl: Optional[int]) -> bytes:
+    # ---- 管理 API（凭配置管理密钥；响应后关闭连接） ------------------------ #
+
+    async def _handle_admin(
+        self,
+        method: bytes,
+        target: bytes,
+        headers: list[tuple[bytes, bytes]],
+        chunked: bool,
+        declared_cl: Optional[int],
+    ) -> None:
+        if not ADMIN_API_KEY:
+            await self._admin_reply(404, {"error": "admin api disabled"})
+            return
+        keys = [v.strip() for k, v in headers if k.lower() == b"x-admin-key"]
+        if len(keys) != 1 or not hmac.compare_digest(
+                keys[0], ADMIN_API_KEY.encode("utf-8")):
+            log.warning("admin auth failed %s target=%s", self._peer, target)
+            await self._admin_reply(403, {"error": "invalid admin key"})
+            return
+
+        if target == b"/admin/status" and method == b"GET":
+            await self._admin_reply(200, self._admin_status())
+            return
+
+        if target == b"/admin/ca-bundle" and method in (b"PUT", b"POST"):
+            if not chunked and declared_cl is not None \
+                    and declared_cl > ADMIN_MAX_BODY:
+                await self._admin_reply(
+                    413, {"error": f"bundle exceeds {ADMIN_MAX_BODY} bytes"})
+                return
+            body = await self._read_body(chunked, declared_cl, ADMIN_MAX_BODY)
+            try:
+                info = await self._trust.replace(body)
+            except ValueError as exc:
+                # 坏包：旧版完整保留。
+                await self._admin_reply(
+                    400, {"error": "invalid CA bundle", "detail": str(exc)})
+                return
+            except OSError as exc:
+                # 保存失败：旧版完整保留（原子写保证磁盘文件未损坏）。
+                await self._admin_reply(
+                    500, {"error": "persist failed", "detail": str(exc)})
+                return
+            # 切换成功：立即关闭旧代际空闲连接；在途旧连接完成后由 release 销毁。
+            info["stale_idle_closed"] = await self._pool.close_stale_idle(
+                self._trust.generation)
+            await self._admin_reply(200, info)
+            return
+
+        await self._admin_reply(404, {"error": "unknown admin endpoint"})
+
+    def _admin_status(self) -> dict:
+        return {
+            "ca": self._trust.info(),
+            "upstream": {
+                "host": UPSTREAM_HOST,
+                "port": UPSTREAM_PORT,
+                "tls": True,
+                "plaintext_fallback": False,
+                "connect_timeout": CONNECT_TIMEOUT,
+                "send_budget": UPSTREAM_TIMEOUT,
+            },
+            "pool": self._pool.stats(),
+        }
+
+    async def _admin_reply(self, status: int, obj: dict) -> None:
+        payload = json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
+        try:
+            self.send_simple(status, payload, keep_alive=False,
+                             content_type=b"application/json; charset=utf-8")
+            await self._finish_gracefully()
+        except (ClientGone, h11.LocalProtocolError, OSError):
+            self._hard_close()
+        raise CloseAfterReply("admin response sent; close inbound")
+
+    # ---- 请求体 ------------------------------------------------------------ #
+
+    async def _read_body(self, chunked: bool, declared_cl: Optional[int],
+                         limit: int) -> bytes:
         """完整读取并校验正文；支持 TCP 分片与流水线（h11 缓冲下一请求字节）。"""
         buf = bytearray()
         while True:
@@ -576,8 +959,8 @@ class InboundProtocol(asyncio.Protocol):
             if not isinstance(event, h11.Data):
                 raise RejectRequest(400, "unexpected event while reading body")
             buf.extend(event.data)
-            if len(buf) > MAX_BODY:
-                raise RejectRequest(413, f"body exceeds {MAX_BODY} bytes")
+            if len(buf) > limit:
+                raise RejectRequest(413, f"body exceeds {limit} bytes")
         # 非 chunked 且带 CL：h11 已按长度截断，这里做双保险确认。
         if not chunked and declared_cl is not None and len(buf) != declared_cl:
             raise RejectRequest(400, "truncated or mismatched Content-Length body")
@@ -640,12 +1023,37 @@ class InboundProtocol(asyncio.Protocol):
         body: bytes,
         keep_alive: bool,
     ) -> None:
-        # 统一截止时刻：从首次发送起 2 秒，期间无论是否重试都不突破该预算。
-        deadline = time.monotonic() + UPSTREAM_TIMEOUT
+        # 2 秒预算从首次向上游发送开始计时；连接/TLS 握手有独立的限时，
+        # 不计入发送预算（换代重握手可能超过 2 秒，但发送期限语义不变）。
+        deadline: Optional[float] = None
         last_exc: Optional[Exception] = None
+        attempt = 0
+        stale_redirects = 0
 
-        for attempt in (1, 2):
-            uc = await self._acquire_abortable()
+        while True:
+            try:
+                uc = await self._acquire_abortable()
+            except UpstreamError as exc:
+                # 连接 / TLS 握手失败（含证书不被信任）：正文从未写出。
+                log.warning("upstream acquire failed %s: %s", self._peer, exc)
+                await self._reply_error(502, b"bad gateway\n", keep_alive=False)
+                raise CloseAfterReply("502 sent; close inbound") from exc
+
+            # 换代竞速：获取后、写出前再核验代际。旧代际连接销毁重取，
+            # 此时正文尚未写出，不算重发也不消耗重试次数。
+            if uc.generation != self._pool.trust_generation():
+                await self._pool.destroy(uc)
+                stale_redirects += 1
+                if stale_redirects > 4:
+                    await self._reply_error(
+                        503, b"trust store switching, retry later\n",
+                        keep_alive=False)
+                    raise CloseAfterReply("503 sent; close inbound")
+                continue
+
+            attempt += 1
+            if deadline is None:
+                deadline = time.monotonic() + UPSTREAM_TIMEOUT
             exchange_task = asyncio.create_task(exchange_upstream(
                 self._pool, uc, b"POST", b"/events", headers, body))
             closed_task = asyncio.create_task(self._closed_event.wait())
@@ -679,7 +1087,7 @@ class InboundProtocol(asyncio.Protocol):
                         status, resp_headers, payload = exchange_task.result()
                     except UpstreamError as exc:
                         await self._pool.destroy(uc)
-                        # 首笔失败（死连接/半开/协议错误）：用全新连接在剩余预算内重试一次。
+                        # 首笔失败（死连接/半开/协议错误）：在剩余预算内重试一次。
                         if attempt == 1 and deadline - time.monotonic() > 0:
                             log.warning(
                                 "upstream exchange failed %s: %s; retrying once",
@@ -695,6 +1103,7 @@ class InboundProtocol(asyncio.Protocol):
                     if self._closed_event.is_set():
                         await self._pool.destroy(uc)
                         raise ClientGone("client closed right after exchange")
+                    # 成功：旧代际连接由 release 内部销毁，绝不回池。
                     await self._pool.release(uc)
                     self._reply_upstream(status, resp_headers, payload, keep_alive)
                     return
@@ -719,10 +1128,6 @@ class InboundProtocol(asyncio.Protocol):
                 if not exchange_task.done():
                     exchange_task.cancel()
                     await _silent_await_cancel(exchange_task)
-
-        # 重试后仍失败（理论上不会走到，防御性兜底）。
-        await self._reply_error(502, b"bad gateway\n", keep_alive=False)
-        raise CloseAfterReply(f"retry exhausted: {last_exc}")
 
     def _reply_upstream(
         self,
@@ -768,14 +1173,25 @@ async def serve() -> None:
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    pool = UpstreamPool(UPSTREAM_HOST, UPSTREAM_PORT, POOL_CAPACITY)
+    trust = TrustStore(CA_BUNDLE_PATH, CA_BUNDLE_SEED, UPSTREAM_TLS_SERVER_NAME)
+    try:
+        trust.load_initial()
+    except (OSError, ValueError) as exc:
+        # 没有可用 CA 包就无法验证上游身份：拒绝启动，绝不静默降级。
+        log.error("cannot initialize trust store: %s", exc)
+        raise SystemExit(2) from exc
+    pool = UpstreamPool(UPSTREAM_HOST, UPSTREAM_PORT, trust, POOL_CAPACITY)
     loop = asyncio.get_running_loop()
 
     server = await loop.create_server(
-        lambda: InboundProtocol(pool), LISTEN_HOST, LISTEN_PORT)
+        lambda: InboundProtocol(pool, trust), LISTEN_HOST, LISTEN_PORT)
     addr = server.sockets[0].getsockname()
-    log.info("proxy listening on %s, upstream=%s:%s, pool=%d, timeout=%.1fs",
-             addr, UPSTREAM_HOST, UPSTREAM_PORT, POOL_CAPACITY, UPSTREAM_TIMEOUT)
+    log.info(
+        "proxy listening on %s, upstream=https://%s:%s (verify name=%s), "
+        "pool=%d, send budget=%.1fs, connect timeout=%.1fs, admin api=%s",
+        addr, UPSTREAM_HOST, UPSTREAM_PORT, UPSTREAM_TLS_SERVER_NAME,
+        POOL_CAPACITY, UPSTREAM_TIMEOUT, CONNECT_TIMEOUT,
+        "enabled" if ADMIN_API_KEY else "disabled")
 
     try:
         async with server:

@@ -2,11 +2,23 @@ services:
   proxy:
     build: ./proxy
     environment:
+      # 上游地址与证书校验 DNS 名都由启动配置固定
       UPSTREAM_HOST: upstream
-      UPSTREAM_PORT: "8000"
+      UPSTREAM_PORT: "8443"
+      UPSTREAM_TLS_SERVER_NAME: logs-receiver.local
+      UPSTREAM_CONNECT_TIMEOUT: "3.0"
+      # CA 包：持久化路径优先，首次启动用种子（CA1）播种
+      CA_BUNDLE_PATH: /run/platform/ca-bundle.crt
+      CA_BUNDLE_SEED: /certs-seed/ca1.crt
+      # 管理密钥（演示默认值，生产必须换成高强度随机值）
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-demo-admin-key}
       LISTEN_HOST: 0.0.0.0
       LISTEN_PORT: "8080"
       LOG_LEVEL: INFO
+    volumes:
+      - ./certs/ca1/ca.crt:/certs-seed/ca1.crt:ro
+      # 成功替换的 CA 包版本持久保存在宿主机 ./.proxy-state/
+      - ./.proxy-state:/run/platform
     ports:
       - "8080:8080"
     depends_on:
@@ -17,7 +29,15 @@ services:
     build: ./upstream
     environment:
       UPSTREAM_MAX_STORED: "200"
+      CERTS_DIR: /certs
+      TLS_ACTIVE_DEFAULT: ca1
+      LOG_LEVEL: info
+    volumes:
+      # 两套 CA 与同名接收端证书（logs-receiver.local）
+      - ./certs:/certs:ro
     ports:
-      # 暴露到宿主机是为了演示时直接查看“上游实收请求”与 /docs
+      # 8000：/docs 演示控制面（明文，仅本地）
       - "8000:8000"
+      # 8443：TLS 业务上报入口（暴露到宿主机便于 openssl s_client 观察）
+      - "8443:8443"
     restart: unless-stopped
